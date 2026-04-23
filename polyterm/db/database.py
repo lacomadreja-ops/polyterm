@@ -260,6 +260,21 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_arb_decisions_ts ON arb_decisions(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_arb_decisions_market_ts ON arb_decisions(market_id, timestamp)")
 
+            # NegRisk event set stability tracking (para evitar ejecutar sets que cambian)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS negrisk_event_sets (
+                    event_id        TEXT PRIMARY KEY,
+                    event_title     TEXT DEFAULT "",
+                    signature       TEXT NOT NULL,          -- JSON list (sorted token_ids/market_ids)
+                    num_outcomes    INTEGER NOT NULL DEFAULT 0,
+                    first_seen      TIMESTAMP NOT NULL,
+                    last_seen       TIMESTAMP NOT NULL,
+                    last_changed_at TIMESTAMP NOT NULL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_negrisk_sets_last_seen ON negrisk_event_sets(last_seen)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_negrisk_sets_changed ON negrisk_event_sets(last_changed_at)")
+
             # Resolutions table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS resolutions (
@@ -1415,6 +1430,98 @@ class Database:
                 (market_id,),
             ).fetchone()
             return dict(row) if row else None
+
+    def observe_negrisk_event_set(
+        self,
+        event_id: str,
+        event_title: str,
+        signature: List[str],
+        num_outcomes: int,
+        timestamp: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Registra (upsert) la firma del set de outcomes del evento NegRisk.
+
+        - Si la firma cambia, resetea el reloj de estabilidad (`last_changed_at`).
+        - Devuelve cuántos segundos han pasado desde el último cambio.
+        """
+        if not event_id:
+            return {"ok": False, "reason": "missing_event_id", "stable_seconds": 0}
+
+        if timestamp is None:
+            timestamp = datetime.now()
+
+        sig_sorted = [str(x) for x in signature if x]
+        sig_sorted.sort()
+        sig_json = json.dumps(sig_sorted, ensure_ascii=False)
+
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT signature, first_seen, last_seen, last_changed_at FROM negrisk_event_sets WHERE event_id = ?",
+                (str(event_id),),
+            ).fetchone()
+
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO negrisk_event_sets
+                        (event_id, event_title, signature, num_outcomes, first_seen, last_seen, last_changed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(event_id),
+                        str(event_title or ""),
+                        sig_json,
+                        int(num_outcomes or 0),
+                        timestamp.isoformat(),
+                        timestamp.isoformat(),
+                        timestamp.isoformat(),
+                    ),
+                )
+                return {"ok": True, "changed": True, "stable_seconds": 0, "signature_size": len(sig_sorted)}
+
+            prev_sig = row["signature"] or "[]"
+            last_changed_at = row["last_changed_at"]
+            if isinstance(last_changed_at, str):
+                try:
+                    last_changed_at_dt = datetime.fromisoformat(last_changed_at.replace("Z", "+00:00"))
+                except Exception:
+                    last_changed_at_dt = timestamp
+            else:
+                last_changed_at_dt = timestamp
+
+            changed = prev_sig != sig_json
+            if changed:
+                last_changed_at_dt = timestamp
+
+            cur.execute(
+                """
+                UPDATE negrisk_event_sets
+                SET event_title = ?,
+                    signature = ?,
+                    num_outcomes = ?,
+                    last_seen = ?,
+                    last_changed_at = ?
+                WHERE event_id = ?
+                """,
+                (
+                    str(event_title or ""),
+                    sig_json,
+                    int(num_outcomes or 0),
+                    timestamp.isoformat(),
+                    last_changed_at_dt.isoformat(),
+                    str(event_id),
+                ),
+            )
+
+            stable_seconds = max(0, int((timestamp - last_changed_at_dt).total_seconds()))
+            return {
+                "ok": True,
+                "changed": changed,
+                "stable_seconds": stable_seconds,
+                "signature_size": len(sig_sorted),
+            }
 
     # ── Mejoras: Decision journal (auditabilidad) ───────────────────────────
 

@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
               help="Spread bruto mínimo para escanear (ej: 0.01 = 1%)")
 @click.option("--scan-interval", "scan_interval", default=30, show_default=True,
               help="Segundos entre scans REST")
+@click.option("--negrisk-stability-minutes", "negrisk_stability_minutes", default=1440, show_default=True,
+              help="Minutos mínimos con set de outcomes estable antes de ejecutar NegRisk (evita eventos que añaden candidatos)")
 @click.option("--no-whale-filter", "no_whale_filter", is_flag=True,
               help="Desactivar filtro de ballenas (no recomendado)")
 @click.option("--whale-min-usd", "whale_min_usd", default=10_000.0, show_default=True,
@@ -93,7 +95,7 @@ logger = logging.getLogger(__name__)
 def trade(
     ctx,
     mode, bankroll, min_edge, max_size, min_liquidity, min_spread,
-    scan_interval, no_whale_filter, whale_min_usd, include_negrisk,
+    scan_interval, negrisk_stability_minutes, no_whale_filter, whale_min_usd, include_negrisk,
     once, limit, debug, show_journal, output_format,
 ):
     """Arbitrage trading bot — detecta y ejecuta spreads YES+NO.
@@ -231,7 +233,12 @@ def trade(
             # ── NegRisk scan ───────────────────────────────────────────
             negrisk_opps = []
             if negrisk:
-                negrisk_opps = negrisk.scan_all(min_spread=min_spread)
+                # En modo debug: incluir también resultados no ejecutables / overpriced
+                # para diagnosticar por qué hay pocas oportunidades underpriced.
+                negrisk_opps = negrisk.scan_all(
+                    min_spread=min_spread,
+                    only_executable=(not debug),
+                )
 
             stats["opps"] += len(opps) + len(negrisk_opps)
 
@@ -252,7 +259,7 @@ def trade(
                 liquid_ok  = nr_opp.get("is_executable", False)
                 if profit_ok and liquid_ok and not debug:
                     nr_ex = _execute_negrisk_paper(
-                        nr_opp, executor, max_size, stats,
+                        nr_opp, executor, max_size, stats, negrisk_stability_minutes=negrisk_stability_minutes,
                         dedupe_always=True,
                     )
                     if nr_ex:
@@ -439,7 +446,8 @@ def _display_table(console, opps, negrisk_opps, results, stats, start_time, debu
             kelly = getattr(opp, 'kelly_size_usd', 0.0)
 
             edge_color = "green" if nedge > 0 else "red"
-            conf_icon  = "🟢" if opp.confidence == "high" else "🟡" if opp.confidence == "medium" else "🔴"
+            # Evitar emojis (cp1252 en Windows puede fallar con Rich legacy renderer)
+            conf_icon = "H" if opp.confidence == "high" else "M" if opp.confidence == "medium" else "L"
 
             table.add_row(
                 opp.market1_title[:42],
@@ -482,11 +490,11 @@ def _display_table(console, opps, negrisk_opps, results, stats, start_time, debu
             if executed:
                 estado = "[green]EJECUTADO[/green]"
             elif is_exe:
-                estado = "[green]✅ líquido[/green]"
+                estado = "[green]LIQUIDO[/green]"
             elif n_liq == 0:
-                estado = "[red]❌ sin liq.[/red]"
+                estado = "[red]SIN_LIQ[/red]"
             else:
-                estado = f"[yellow]⚠ {n_tot-n_liq} ilíq.[/yellow]"
+                estado = f"[yellow]{n_tot-n_liq}_ILIQ[/yellow]"
 
             nr_table.add_row(
                 nr["event_title"][:35],
@@ -504,8 +512,9 @@ def _display_table(console, opps, negrisk_opps, results, stats, start_time, debu
 
     # Stats rápidas
     console.print(
-        f"[dim]Ejecutados: {stats['executed']} │ "
-        f"Skipped whale: {stats['skipped_whale']} │ "
+        # Evitar separadores unicode (Windows cp1252 puede fallar)
+        f"[dim]Ejecutados: {stats['executed']} | "
+        f"Skipped whale: {stats['skipped_whale']} | "
         f"Skipped edge: {stats['skipped_edge']}[/dim]"
     )
 
@@ -591,6 +600,7 @@ def _execute_negrisk_paper(
     executor,
     max_size: float,
     stats: dict,
+    negrisk_stability_minutes: float = 1440.0,
     dedupe_always: bool = True,
 ):
     """
@@ -611,6 +621,42 @@ def _execute_negrisk_paper(
     size = min(kelly_usd, max_size)
     if size <= 0 or not outcomes:
         return None
+
+    # Estabilidad del set: evitar ejecutar eventos que cambian outcomes (añaden candidatos)
+    try:
+        db = getattr(executor, "db", None)
+        if db and hasattr(db, "observe_negrisk_event_set") and negrisk_stability_minutes and negrisk_stability_minutes > 0:
+            sig = [o.get("token_id") or o.get("market_id") for o in outcomes if isinstance(o, dict)]
+            obs = db.observe_negrisk_event_set(
+                event_id=str(event_id),
+                event_title=str(title),
+                signature=[str(x) for x in sig if x],
+                num_outcomes=len(outcomes),
+            )
+            stable_seconds = int(obs.get("stable_seconds", 0) or 0)
+            required = int(float(negrisk_stability_minutes) * 60)
+            if stable_seconds < required:
+                if hasattr(db, "save_arb_decision"):
+                    import time as _time
+                    db.save_arb_decision(
+                        opportunity_id=f"{event_id}:{_time.time()}",
+                        market_id=event_id,
+                        market_title=title,
+                        decision="SKIP",
+                        reason="negrisk_set_unstable",
+                        data={
+                            "stable_seconds": stable_seconds,
+                            "required_seconds": required,
+                            "changed": bool(obs.get("changed", False)),
+                            "signature_size": int(obs.get("signature_size", 0) or 0),
+                            "num_outcomes": len(outcomes),
+                            "fee_adjusted_profit": profit_100,
+                        },
+                    )
+                return None
+    except Exception:
+        # no bloquear trading si falla el tracking de estabilidad
+        pass
 
     # Deduplicación estricta por event_id (guardado como market_id en arb_executions)
     try:
