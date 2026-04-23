@@ -313,7 +313,8 @@ def _show_completion(console: Console):
     # Mark tutorial as completed
     try:
         from pathlib import Path
-        onboarded_file = Path.home() / ".polyterm" / ".onboarded"
+        from ...utils.paths import get_polyterm_dir
+        onboarded_file = get_polyterm_dir() / ".onboarded"
         onboarded_file.parent.mkdir(parents=True, exist_ok=True)
         onboarded_file.touch()
     except Exception:

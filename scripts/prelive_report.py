@@ -10,14 +10,25 @@ Genera un reporte pre-LIVE desde ~/.polyterm/data.db:
 
 import json
 import sqlite3
+import sys
+from pathlib import Path as _PathForSysPath
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+# Ensure repo root is importable when running as a script
+_REPO_ROOT = _PathForSysPath(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-DB_PATH = Path.home() / ".polyterm" / "data.db"
+
+def _db_path() -> Path:
+    """Return the same DB path PolyTerm uses at runtime."""
+    from polyterm.utils.paths import get_polyterm_dir
+
+    return get_polyterm_dir() / "data.db"
 
 
 def _dt(x: Any) -> datetime | None:
@@ -37,7 +48,7 @@ def _dt(x: Any) -> datetime | None:
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(_db_path()))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -75,8 +86,9 @@ def load_executions(conn: sqlite3.Connection, hours: float) -> List[Dict[str, An
 
 
 def summarize(hours: float = 24.0) -> Dict[str, Any]:
-    if not DB_PATH.exists():
-        return {"ok": False, "error": f"DB not found: {DB_PATH}"}
+    db_path = _db_path()
+    if not db_path.exists():
+        return {"ok": False, "error": f"DB not found: {db_path}"}
 
     conn = _connect()
     try:
@@ -108,7 +120,7 @@ def summarize(hours: float = 24.0) -> Dict[str, Any]:
 
     return {
         "ok": True,
-        "db": str(DB_PATH),
+        "db": str(db_path),
         "hours": hours,
         "decisions_total": len(decisions),
         "decision_counts": dict(decision_counts),

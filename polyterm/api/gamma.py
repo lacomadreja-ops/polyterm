@@ -37,7 +37,7 @@ class RateLimiter:
 class SharedRateLimiter:
     """Cross-process rate limiter using file-based coordination.
 
-    Uses a lockfile at ``~/.polyterm/gamma_rate.lock`` (configurable) to
+    Uses a lockfile at ``$POLYTERM_DIR/gamma_rate.lock`` (configurable) to
     coordinate Gamma API request timing across concurrent PolyTerm processes.
     Falls back to a per-process ``RateLimiter`` when file locking is
     unavailable (e.g. Windows or permission errors).
@@ -53,7 +53,8 @@ class SharedRateLimiter:
     ):
         self.requests_per_minute = requests_per_minute
         self.min_interval = 60.0 / requests_per_minute
-        self._lock_dir = Path(lock_dir) if lock_dir else Path.home() / ".polyterm"
+        from ..utils.paths import get_polyterm_dir
+        self._lock_dir = Path(lock_dir) if lock_dir else get_polyterm_dir()
         self._lock_file = self._lock_dir / "gamma_rate.lock"
         self._fallback = RateLimiter(requests_per_minute)
         self._shared_available = self._init_shared()

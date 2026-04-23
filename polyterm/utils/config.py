@@ -6,6 +6,7 @@ import toml
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .paths import get_polyterm_dir
 
 class Config:
     """Manages PolyTerm configuration"""
@@ -94,7 +95,7 @@ class Config:
         if config_path:
             self.config_path = Path(config_path)
         else:
-            self.config_path = Path.home() / ".polyterm" / "config.toml"
+            self.config_path = get_polyterm_dir() / "config.toml"
         
         self.config = self._load_config()
     

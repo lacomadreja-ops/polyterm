@@ -3,12 +3,12 @@
 - **Qué resuelve el proyecto**: `polyterm` es una app de **monitorización + analítica + utilidades operativas** para Polymarket (prediction markets), con un **bot de “arbitraje”** (principalmente NegRisk multi‑outcome y, secundariamente, intra‑market binario) ejecutable vía CLI/TUI.
 - **Qué tipo de sistema es**: sistema **CLI/TUI** en Python, con:
   - clientes HTTP/WS hacia APIs públicas de Polymarket,
-  - persistencia local en SQLite (`~/.polyterm/data.db`),
+  - persistencia local en SQLite (`POLYTERM_DIR/data.db`),
   - comandos operativos (monitor, whales, arbitrage, trade, orderbook, etc.),
   - modo paper y un modo real (parcial/condicional).
 - **Flujo de alto nivel (5–10 bullets)**:
   - Entrypoint consola `polyterm=polyterm.cli.main:cli` (`setup.py`).
-  - Inicializa config `Config()` (`polyterm/utils/config.py`) y logging a `~/.polyterm/polyterm.log` (`polyterm/cli/main.py`).
+  - Inicializa config `Config()` (`polyterm/utils/config.py`) y logging a `POLYTERM_DIR/polyterm.log` (resuelto por `polyterm/utils/paths.py:get_polyterm_dir()`) (`polyterm/cli/main.py`).
   - Si se lanza sin subcomando, abre TUI `TUIController.run()` (`polyterm/tui/controller.py`) y despacha pantallas.
   - Si se lanza un subcomando, `LazyGroup` importa el comando bajo demanda (`polyterm/cli/lazy_group.py`).
   - Comandos core consumen datos de `GammaClient` (`polyterm/api/gamma.py`), `CLOBClient` (`polyterm/api/clob.py`) y/o `DataAPIClient` (`polyterm/api/data_api.py`).
@@ -36,12 +36,12 @@
     - Gamma REST (`polyterm/api/gamma.py`).
     - CLOB REST/WS (`polyterm/api/clob.py`).
     - Data API (`polyterm/api/data_api.py`), y en algunos puntos acceso directo vía `requests` (p.ej. `polyterm/core/whale_filter.py`).
-  - Config local: `~/.polyterm/config.toml` (`polyterm/utils/config.py`).
+  - Config local: `POLYTERM_DIR/config.toml` (resuelto por `polyterm/utils/paths.py:get_polyterm_dir()`) (`polyterm/utils/config.py`).
   - Variables de entorno para modo real (ver `polyterm/cli/commands/trade.py` y `polyterm/core/execution.py`).
 - **Salidas**:
   - Output en consola (tablas Rich o JSON) en CLI/TUI.
-  - Persistencia en `~/.polyterm/data.db` (SQLite).
-  - Logging a `~/.polyterm/polyterm.log`.
+  - Persistencia en `POLYTERM_DIR/data.db` (SQLite).
+  - Logging a `POLYTERM_DIR/polyterm.log`.
 - **Decisiones que toma**:
   - Selección de oportunidades (thresholds: spread/edge, liquidez, ejecutabilidad).
   - Filtros de riesgo (ballenas/insider) (`polyterm/core/whale_filter.py`).
@@ -108,10 +108,10 @@ Marcado:
 # 4. Componentes principales
 
 ## `polyterm/cli/main.py`
-- **Responsabilidad**: entrypoint Click `cli()`, crea `Config()`, configura logging a `~/.polyterm/polyterm.log`, lanza TUI si no hay subcomando.
+- **Responsabilidad**: entrypoint Click `cli()`, crea `Config()`, configura logging a `POLYTERM_DIR/polyterm.log`, lanza TUI si no hay subcomando.
 - **Quién lo llama**: console script `polyterm` (`setup.py`).
 - **Dependencias**: `click`, `logging`, `Path.home()`, `polyterm/utils/config.py`, `polyterm/tui/controller.py`.
-- **Estado que modifica**: crea `~/.polyterm/`, escribe `polyterm.log`.
+- **Estado que modifica**: escribe en `POLYTERM_DIR/` (p.ej. `polyterm.log`, `data.db`), resuelto por `polyterm/utils/paths.py:get_polyterm_dir()`.
 - **Side effects**: filesystem (dir/log), output consola.
 - **Fallos**: permisos FS, path HOME inesperado, handlers duplicados (mitigado con `root.handlers.clear()`).
 
@@ -121,7 +121,7 @@ Marcado:
 - **Fallos**: import errors por dependencias faltantes; docstrings para help usan AST sobre archivo → puede fallar con sintaxis/encoding.
 
 ## `polyterm/tui/controller.py`
-- **Responsabilidad**: bucle principal TUI, onboarding en `~/.polyterm/.onboarded`, dispatch de pantallas vía `SCREEN_ROUTES`.
+- **Responsabilidad**: bucle principal TUI, onboarding en `POLYTERM_DIR/.onboarded`, dispatch de pantallas vía `SCREEN_ROUTES`.
 - **Quién lo llama**: `cli()` cuando no hay subcomando.
 - **Side effects**: FS (onboard flag), output interactivo, llamadas a APIs/DB indirectamente vía pantallas.
 - **Fallos**: excepciones en pantallas se encapsulan con `handle_api_error()` (pero no garantiza trazabilidad).
@@ -132,7 +132,7 @@ Marcado:
   - Loop: fetch markets → `scanner.scan_intra_market_arbitrage()` → (opcional) `negrisk.scan_all()` → filtros → ejecución.
   - Persistencia: `arb_executions` (y `arb_decisions` para auditoría).
 - **Entradas**: flags CLI (`--mode`, `--min-edge`, `--min-spread`, `--limit`, `--negrisk/--no-negrisk`, etc.).
-- **Outputs**: consola (table/json), DB (`~/.polyterm/data.db`).
+- **Outputs**: consola (table/json), DB (`POLYTERM_DIR/data.db`).
 - **Side effects**: red (Gamma/CLOB/Data API), DB writes, logs.
 - **Fallos típicos**: rate limits, timeouts, JSON malformado, WS no disponible (según otros comandos), decisiones no trazadas si falta DB o falla commit.
 
@@ -182,7 +182,7 @@ Marcado:
   - `arb_executions` (ejecuciones de arbitraje).
   - `arb_decisions` (decisiones/skip/error del pipeline).
   - `trades`, `wallets`, `alerts`, `market_snapshots`, `positions`, `resolutions`, etc.
-- **Side effects**: FS (`~/.polyterm/data.db`), auto cleanup.
+- **Side effects**: FS (`POLYTERM_DIR/data.db`), auto cleanup.
 - **Fallos**: locks SQLite si procesos concurrentes; migraciones parciales; dependencia de integridad FK (trades → wallets).
 
 # 5. Entry points y ciclo de ejecución
@@ -313,6 +313,11 @@ Desde `polyterm/cli/commands/trade.py`:
 - `--no-whale-filter`, `--whale-min-usd`, `lookback_minutes` (en WhaleFilter).
 - `ExecutionMode` (`paper` vs `real`).
 
+### Control anti re-ejecución (estado actual)
+- **Deduplicación estricta por `market_id`**: si existe **cualquier** fila previa en `arb_executions` para ese `market_id`, la oportunidad se marca `SKIP` en `arb_decisions` con:
+  - `reason="already_executed_market"`
+  - y **no se vuelve a ejecutar**, independientemente de si el mercado está cerrado/resuelto o no.
+
 Desde `polyterm/core/negrisk.py`:
 - `polymarket_fee`, `min_outcome_liquidity`, `max_kelly_fraction`, sanity range `[0.3, 1.5]`.
 
@@ -366,7 +371,7 @@ Lista priorizada (firma aproximada + archivo):
 # 8. Configuración y variables de entorno
 
 ## Config TOML
-- Archivo: `~/.polyterm/config.toml` (ruta por defecto) (`polyterm/utils/config.py`).
+- Archivo: `POLYTERM_DIR/config.toml` (ruta por defecto lógica; resuelto por `polyterm/utils/paths.py:get_polyterm_dir()`) (`polyterm/utils/config.py`).
 - Defaults: `Config.DEFAULT_CONFIG` (incluye endpoints, alert thresholds, whale tracking, arbitrage params).
 - Parámetros relevantes:
   - `api.gamma_base_url`, `api.clob_rest_endpoint`, `api.subgraph_endpoint`, etc.
@@ -391,7 +396,7 @@ Referencias:
 # 9. Persistencia y datos
 
 ## Base de datos
-- Archivo: `~/.polyterm/data.db` (`polyterm/db/database.py`).
+- Archivo: `POLYTERM_DIR/data.db` (resuelto por `polyterm/utils/paths.py:get_polyterm_dir()`) (`polyterm/db/database.py`).
 - Tablas clave para trading:
   - `arb_executions`: ejecuciones (paper/real).
   - `arb_decisions`: decisiones (execute/skip/error) para auditoría.
@@ -409,7 +414,7 @@ Referencias:
 # 10. Logging, métricas y observabilidad
 
 ## Dónde loguea
-- `~/.polyterm/polyterm.log` configurado en `polyterm/cli/main.py`.
+- `POLYTERM_DIR/polyterm.log` configurado en `polyterm/cli/main.py` (resuelto por `polyterm/utils/paths.py:get_polyterm_dir()`).
 - Módulos usan `logging.getLogger(__name__)` (e.g. `polyterm/core/negrisk.py`, `polyterm/core/execution.py`, `polyterm/core/whale_tracker.py`).
 
 ## Qué eventos clave quedan trazados
@@ -544,8 +549,8 @@ Referencias:
   1. `LOGICA_AI.md` (este archivo).
   2. `polyterm/cli/commands/trade.py` (orquestación) y `polyterm/core/negrisk.py` (señal principal).
   3. `polyterm/core/execution.py` (paper/real) y `polyterm/db/database.py` (journal).
-  4. Logs en `~/.polyterm/polyterm.log`.
-  5. DB `~/.polyterm/data.db` (tablas `arb_decisions`, `arb_executions`).
+  4. Logs en `POLYTERM_DIR/polyterm.log`.
+  5. DB `POLYTERM_DIR/data.db` (tablas `arb_decisions`, `arb_executions`).
 - **Para fallos de “no ejecuta”**:
   - Mirar `arb_decisions.reason` (edge_below_threshold, whale_filter, exec_exception, negrisk_paper).
   - Cruzar con logs `NegRiskAnalyzer` (liquidez, sanity-check) y con parámetros CLI (`--min-edge`, `--min-spread`, `--no-negrisk`).

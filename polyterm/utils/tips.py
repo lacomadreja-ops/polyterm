@@ -137,7 +137,8 @@ class TipTracker:
 
     def __init__(self):
         self.shown_tips = set()
-        self.tip_file = Path.home() / ".polyterm" / ".shown_tips"
+        from .paths import get_polyterm_dir
+        self.tip_file = get_polyterm_dir() / ".shown_tips"
 
     def _load_shown(self):
         """Load previously shown tips"""

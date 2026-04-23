@@ -2,9 +2,9 @@
 
 import logging
 import click
-from pathlib import Path
 
 from .lazy_group import LAZY_COMMANDS, LazyGroup
+from ..utils.paths import get_polyterm_dir
 
 
 Config = None
@@ -12,8 +12,7 @@ Config = None
 
 def _setup_logging():
     """Configura logging a fichero y consola."""
-    log_dir = Path.home() / ".polyterm"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = get_polyterm_dir()
     log_file = log_dir / "polyterm.log"
 
     fmt = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"

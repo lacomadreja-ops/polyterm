@@ -6,6 +6,7 @@ from rich.prompt import Confirm
 from .logo import display_logo
 from .menu import MainMenu
 from ..utils.errors import handle_api_error
+from ..utils.paths import get_polyterm_dir
 from .screens import (
     monitor_screen,
     live_monitor_screen,
@@ -185,7 +186,7 @@ class TUIController:
         self.console = Console()
         self.menu = MainMenu()
         self.running = True
-        self.onboarded_file = Path.home() / ".polyterm" / ".onboarded"
+        self.onboarded_file = get_polyterm_dir() / ".onboarded"
 
     def _check_first_run(self) -> bool:
         """Check if this is the user's first run"""

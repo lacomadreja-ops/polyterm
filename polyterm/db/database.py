@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 
 from .models import Wallet, Trade, Alert, MarketSnapshot, ArbitrageOpportunity, ResolutionOutcome
+from ..utils.paths import get_polyterm_dir
 
 
 class Database:
@@ -17,7 +18,7 @@ class Database:
         if db_path:
             self.db_path = Path(db_path)
         else:
-            self.db_path = Path.home() / ".polyterm" / "data.db"
+            self.db_path = get_polyterm_dir() / "data.db"
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -1405,6 +1406,15 @@ class Database:
                 (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_last_execution_for_market(self, market_id: str) -> Optional[Dict[str, Any]]:
+        """Devuelve la última ejecución (arb_executions) para un market_id."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM arb_executions WHERE market_id = ? ORDER BY timestamp DESC LIMIT 1",
+                (market_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
     # ── Mejoras: Decision journal (auditabilidad) ───────────────────────────
 

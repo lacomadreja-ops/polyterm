@@ -134,7 +134,7 @@ def handle_config_error(console: Console, error: Exception):
         console,
         "Configuration Error",
         "There's an issue with your configuration.",
-        suggestion="Try running 'polyterm config' to fix settings, or delete ~/.polyterm/config.toml to reset.",
+        suggestion="Try running 'polyterm config' to fix settings, or delete your runtime config (POLYTERM_DIR/config.toml) to reset.",
         details=str(error),
     )
 
@@ -190,7 +190,7 @@ ERROR_MESSAGES = {
     "database_error": {
         "title": "Database Error",
         "message": "Could not access the local database.",
-        "suggestion": "Try deleting ~/.polyterm/data.db and restarting PolyTerm.",
+        "suggestion": "Try deleting your runtime data.db (POLYTERM_DIR/data.db) and restarting PolyTerm.",
     },
 }
 

@@ -106,7 +106,7 @@ def trade(
     3. Sizing Kelly (half-Kelly conservador)
     4. Filtro de ballenas/insiders
     5. Ejecución paper o real
-    6. Journal en la DB de PolyTerm (~/.polyterm/data.db)
+    6. Journal en la DB de PolyTerm (ver POLYTERM_DIR; por defecto /logs)
 
     \b
     Ejemplos:
@@ -240,6 +240,7 @@ def trade(
             for opp in opps:
                 result = asyncio.run(_process_opportunity(
                     opp, executor, whale_filter, min_edge, stats,
+                    dedupe_always=True,
                 ))
                 if result:
                     all_results.append(result)
@@ -250,7 +251,10 @@ def trade(
                 profit_ok  = nr_opp.get("fee_adjusted_profit", 0) >= min_edge
                 liquid_ok  = nr_opp.get("is_executable", False)
                 if profit_ok and liquid_ok and not debug:
-                    nr_ex = _execute_negrisk_paper(nr_opp, executor, max_size, stats)
+                    nr_ex = _execute_negrisk_paper(
+                        nr_opp, executor, max_size, stats,
+                        dedupe_always=True,
+                    )
                     if nr_ex:
                         nr_results.append(nr_ex)
 
@@ -279,7 +283,14 @@ def trade(
 
 # ─── Pipeline async de oportunidad ──────────────────────────────────────────
 
-async def _process_opportunity(opp, executor, whale_filter, min_edge, stats):
+async def _process_opportunity(
+    opp,
+    executor,
+    whale_filter,
+    min_edge,
+    stats,
+    dedupe_always: bool = True,
+):
     """Procesa una oportunidad: filtrar → ejecutar → retornar resultado."""
     db = getattr(executor, "db", None)
     opp_id = f"{getattr(opp, 'market1_id', '')}:{getattr(getattr(opp, 'timestamp', None), 'isoformat', lambda: '')()}"
@@ -326,6 +337,28 @@ async def _process_opportunity(opp, executor, whale_filter, min_edge, stats):
                     },
                 )
             return None
+
+    # Deduplicación estricta: si ya hubo ejecución en este market_id, no re-ejecutar jamás.
+    try:
+        if dedupe_always and db and hasattr(db, "get_last_execution_for_market"):
+            last = db.get_last_execution_for_market(market_id)
+            if last:
+                if db and hasattr(db, "save_arb_decision"):
+                    db.save_arb_decision(
+                        opportunity_id=opp_id,
+                        market_id=market_id,
+                        market_title=title,
+                        decision="SKIP",
+                        reason="already_executed_market",
+                        data={
+                            "last_execution": last,
+                            "net_edge": net_edge,
+                        },
+                    )
+                return None
+    except Exception:
+        # No bloquear trading por fallo de dedupe check
+        pass
 
     # Ejecutar
     try:
@@ -546,13 +579,20 @@ def _display_final_report(console, executor, stats, start_time):
         pass
 
     console.print()
-    console.print("[dim]Datos guardados en ~/.polyterm/data.db[/dim]")
+    from ...utils.paths import get_polyterm_dir
+    console.print(f"[dim]Datos guardados en {get_polyterm_dir()}/data.db[/dim]")
     console.print("[dim]Consulta el journal: polyterm trade --journal[/dim]")
 
 
 # ─── NegRisk paper execution ─────────────────────────────────────────────────
 
-def _execute_negrisk_paper(nr_opp: dict, executor, max_size: float, stats: dict):
+def _execute_negrisk_paper(
+    nr_opp: dict,
+    executor,
+    max_size: float,
+    stats: dict,
+    dedupe_always: bool = True,
+):
     """
     Simula la ejecución de un arb NegRisk en papel.
     Compra todos los outcomes YES del evento.
@@ -571,6 +611,28 @@ def _execute_negrisk_paper(nr_opp: dict, executor, max_size: float, stats: dict)
     size = min(kelly_usd, max_size)
     if size <= 0 or not outcomes:
         return None
+
+    # Deduplicación estricta por event_id (guardado como market_id en arb_executions)
+    try:
+        db = getattr(executor, "db", None)
+        if dedupe_always and db and hasattr(db, "get_last_execution_for_market"):
+            last = db.get_last_execution_for_market(event_id)
+            if last:
+                if hasattr(db, "save_arb_decision"):
+                    db.save_arb_decision(
+                        opportunity_id=f"{event_id}:{_time.time()}",
+                        market_id=event_id,
+                        market_title=title,
+                        decision="SKIP",
+                        reason="already_executed_market",
+                        data={
+                            "last_execution": last,
+                            "fee_adjusted_profit": profit_100,
+                        },
+                    )
+                return None
+    except Exception:
+        pass
 
     # Distribuir el capital entre todos los outcomes proporcionalmente
     size_per_outcome = size / len(outcomes)
@@ -710,5 +772,6 @@ def _display_journal(console, db, output_format):
             f"[{'green' if pnl >= 0 else 'red'}]${pnl:.4f}[/]",
             "[green]OK[/green]" if ok else "[red]X[/red]",
         )
+    from ...utils.paths import get_polyterm_dir
     console.print(t)
-    console.print("\n[dim]DB: ~/.polyterm/data.db[/dim]")
+    console.print(f"\n[dim]DB: {get_polyterm_dir()}/data.db[/dim]")
