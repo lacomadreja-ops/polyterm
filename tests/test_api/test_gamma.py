@@ -1,0 +1,909 @@
+"""Comprehensive tests for Gamma Markets API client"""
+
+import os
+import time
+import pytest
+import responses
+import requests
+from unittest.mock import patch, MagicMock
+from polyterm.api.gamma import GammaClient, RateLimiter, SharedRateLimiter
+
+
+GAMMA_ENDPOINT = "https://gamma-api.polymarket.com"
+
+
+class TestRateLimiter:
+    """Test RateLimiter class"""
+
+    def test_initialization(self):
+        """Test rate limiter initializes with correct values"""
+        limiter = RateLimiter(requests_per_minute=60)
+        assert limiter.requests_per_minute == 60
+        assert limiter.min_interval == 1.0
+        assert limiter.last_request_time == 0
+
+    def test_initialization_high_rate(self):
+        """Test rate limiter with high request rate"""
+        limiter = RateLimiter(requests_per_minute=120)
+        assert limiter.min_interval == 0.5
+
+    def test_initialization_low_rate(self):
+        """Test rate limiter with low request rate"""
+        limiter = RateLimiter(requests_per_minute=30)
+        assert limiter.min_interval == 2.0
+
+    def test_first_call_no_wait(self):
+        """Test that the first call does not wait (last_request_time is 0)"""
+        limiter = RateLimiter(requests_per_minute=60)
+        start = time.time()
+        limiter.wait_if_needed()
+        elapsed = time.time() - start
+        # First call should be near-instant since last_request_time=0 is far in the past
+        assert elapsed < 0.1
+
+    def test_wait_if_needed_enforces_delay(self):
+        """Test that consecutive calls enforce the minimum interval"""
+        limiter = RateLimiter(requests_per_minute=120)  # 0.5s interval
+        limiter.wait_if_needed()  # First call - no wait
+        start = time.time()
+        limiter.wait_if_needed()  # Second call - should wait
+        elapsed = time.time() - start
+        assert elapsed >= limiter.min_interval - 0.05  # Small tolerance
+
+    def test_updates_last_request_time(self):
+        """Test that wait_if_needed updates last_request_time"""
+        limiter = RateLimiter(requests_per_minute=60)
+        assert limiter.last_request_time == 0
+        limiter.wait_if_needed()
+        assert limiter.last_request_time > 0
+
+    @patch("time.sleep")
+    @patch("time.time")
+    def test_wait_calculates_correct_sleep_duration(self, mock_time, mock_sleep):
+        """Test the exact sleep duration calculation"""
+        limiter = RateLimiter(requests_per_minute=60)  # 1.0s interval
+        # Simulate: last request was at t=10.0, current time is t=10.3
+        limiter.last_request_time = 10.0
+        mock_time.side_effect = [10.3, 10.7]  # current_time, then after sleep for update
+
+        limiter.wait_if_needed()
+
+        # Should sleep for 1.0 - 0.3 = 0.7 seconds
+        mock_sleep.assert_called_once_with(pytest.approx(0.7, abs=0.01))
+
+
+class TestSharedRateLimiter:
+    """Test SharedRateLimiter cross-process coordination"""
+
+    def test_initialization(self, tmp_path):
+        """Test shared rate limiter initializes with correct values"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        assert limiter.requests_per_minute == 60
+        assert limiter.min_interval == 1.0
+
+    def test_creates_lock_directory(self, tmp_path):
+        """Test that lock directory is created during init"""
+        lock_dir = tmp_path / "subdir"
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(lock_dir))
+        assert lock_dir.exists()
+
+    def test_first_call_no_wait(self, tmp_path):
+        """Test that the first call does not wait"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        start = time.time()
+        limiter.wait_if_needed()
+        elapsed = time.time() - start
+        assert elapsed < 0.1
+
+    def test_consecutive_calls_enforce_delay(self, tmp_path):
+        """Test that consecutive calls enforce the minimum interval"""
+        limiter = SharedRateLimiter(requests_per_minute=120, lock_dir=str(tmp_path))
+        limiter.wait_if_needed()  # First call
+        start = time.time()
+        limiter.wait_if_needed()  # Second call — should wait
+        elapsed = time.time() - start
+        assert elapsed >= limiter.min_interval - 0.05
+
+    def test_cross_instance_coordination(self, tmp_path):
+        """Test that two separate instances sharing a lock dir coordinate"""
+        limiter1 = SharedRateLimiter(requests_per_minute=120, lock_dir=str(tmp_path))
+        limiter2 = SharedRateLimiter(requests_per_minute=120, lock_dir=str(tmp_path))
+
+        limiter1.wait_if_needed()
+        start = time.time()
+        limiter2.wait_if_needed()
+        elapsed = time.time() - start
+        assert elapsed >= limiter1.min_interval - 0.05
+
+    def test_stale_timestamp_ignored(self, tmp_path):
+        """Test that stale timestamps (>120s old) are treated as fresh start"""
+        lock_file = tmp_path / "gamma_rate.lock"
+        # Write a very old timestamp
+        lock_file.write_text(str(time.time() - 300))
+
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        start = time.time()
+        limiter.wait_if_needed()
+        elapsed = time.time() - start
+        # Should not wait because the timestamp is stale
+        assert elapsed < 0.1
+
+    def test_corrupted_lock_file_handled(self, tmp_path):
+        """Test that corrupted lock file content is handled gracefully"""
+        lock_file = tmp_path / "gamma_rate.lock"
+        lock_file.write_text("not-a-number")
+
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        start = time.time()
+        limiter.wait_if_needed()
+        elapsed = time.time() - start
+        assert elapsed < 0.1
+
+    def test_empty_lock_file_handled(self, tmp_path):
+        """Test that empty lock file is handled gracefully"""
+        lock_file = tmp_path / "gamma_rate.lock"
+        lock_file.write_text("")
+
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        start = time.time()
+        limiter.wait_if_needed()
+        elapsed = time.time() - start
+        assert elapsed < 0.1
+
+    def test_fallback_when_fcntl_unavailable(self, tmp_path):
+        """Test graceful fallback to per-process limiter when fcntl is unavailable"""
+        with patch.dict("sys.modules", {"fcntl": None}):
+            with patch("polyterm.api.gamma.SharedRateLimiter._init_shared", return_value=False):
+                limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+                assert limiter._shared_available is False
+                # Should still work via fallback
+                start = time.time()
+                limiter.wait_if_needed()
+                elapsed = time.time() - start
+                assert elapsed < 0.1
+
+    def test_fallback_on_runtime_error(self, tmp_path):
+        """Test that runtime errors during shared wait fall back gracefully"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        limiter._shared_available = True
+
+        with patch.object(limiter, "_shared_wait", side_effect=OSError("disk full")):
+            # Should not raise — falls back to per-process
+            limiter.wait_if_needed()
+
+    def test_lock_file_updated_after_call(self, tmp_path):
+        """Test that the lock file contains a recent timestamp after a call"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        before = time.time()
+        limiter.wait_if_needed()
+        after = time.time()
+
+        lock_file = tmp_path / "gamma_rate.lock"
+        stored = float(lock_file.read_text().strip())
+        assert before <= stored <= after + 0.1
+
+    def test_gamma_client_uses_shared_limiter(self):
+        """Test that GammaClient uses SharedRateLimiter by default"""
+        client = GammaClient()
+        assert isinstance(client.rate_limiter, SharedRateLimiter)
+        client.close()
+
+
+class TestSharedRateLimiterEdgeCases:
+    """Edge-case tests for SharedRateLimiter"""
+
+    def test_init_shared_false_on_mkdir_oserror(self, tmp_path):
+        """_init_shared returns False when mkdir fails"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        with patch("pathlib.Path.mkdir", side_effect=OSError("permission denied")):
+            assert limiter._init_shared() is False
+
+    def test_init_shared_false_on_import_error(self, tmp_path):
+        """_init_shared returns False when fcntl is unavailable"""
+        import sys
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        with patch.dict(sys.modules, {"fcntl": None}):
+            with patch("builtins.__import__", side_effect=ImportError("no fcntl")):
+                assert limiter._init_shared() is False
+
+    def test_fdopen_failure_closes_fd(self, tmp_path):
+        """If os.fdopen fails, the raw fd is closed before reraising"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+
+        with patch("os.open", return_value=42) as mock_open:
+            with patch("os.fdopen", side_effect=OSError("bad fd")):
+                with patch("os.close") as mock_close:
+                    with pytest.raises(OSError, match="bad fd"):
+                        limiter._shared_wait()
+                    mock_close.assert_called_once_with(42)
+
+    def test_flock_unlock_failure_swallowed(self, tmp_path):
+        """fcntl.flock unlock failure is silently swallowed"""
+        import fcntl
+
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+
+        original_flock = fcntl.flock
+        call_count = [0]
+
+        def flock_fail_on_unlock(f, op):
+            call_count[0] += 1
+            if op == fcntl.LOCK_UN:
+                raise OSError("unlock failed")
+            return original_flock(f, op)
+
+        with patch("fcntl.flock", side_effect=flock_fail_on_unlock):
+            # Should not raise despite unlock failure
+            limiter.wait_if_needed()
+
+    def test_concurrent_thread_access(self, tmp_path):
+        """Multiple threads using the same lock dir don't corrupt state"""
+        import threading
+
+        limiter1 = SharedRateLimiter(requests_per_minute=600, lock_dir=str(tmp_path))
+        limiter2 = SharedRateLimiter(requests_per_minute=600, lock_dir=str(tmp_path))
+
+        results = []
+        errors = []
+
+        def call_limiter(limiter, count):
+            for _ in range(count):
+                try:
+                    limiter.wait_if_needed()
+                    results.append(time.time())
+                except Exception as e:
+                    errors.append(e)
+
+        t1 = threading.Thread(target=call_limiter, args=(limiter1, 5))
+        t2 = threading.Thread(target=call_limiter, args=(limiter2, 5))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        assert len(errors) == 0
+        assert len(results) == 10
+
+    def test_slot_calculation_reserves_future_time(self, tmp_path):
+        """When lock file has a very recent timestamp, slot is pushed ahead"""
+        lock_file = tmp_path / "gamma_rate.lock"
+        # Write a timestamp that is 0.1s in the future
+        future_slot = time.time() + 0.1
+        lock_file.write_text(str(future_slot))
+
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+        start = time.time()
+        limiter.wait_if_needed()
+        elapsed = time.time() - start
+
+        # Should have waited for the future slot + min_interval
+        assert elapsed >= 0.1  # at least past the reserved slot
+
+    def test_shared_wait_exception_degrades_to_per_process(self, tmp_path):
+        """Any exception in _shared_wait degrades to per-process fallback"""
+        limiter = SharedRateLimiter(requests_per_minute=60, lock_dir=str(tmp_path))
+
+        with patch.object(limiter, "_shared_wait", side_effect=RuntimeError("boom")):
+            with patch.object(limiter._fallback, "wait_if_needed") as mock_fallback:
+                limiter.wait_if_needed()
+                mock_fallback.assert_called_once()
+
+
+class TestGammaClientRequest:
+    """Test _request method retry logic and error handling"""
+
+    @pytest.fixture
+    def client(self):
+        client = GammaClient(base_url=GAMMA_ENDPOINT)
+        # Set last_request_time far in the past to avoid rate limiter delays in tests
+        client.rate_limiter.last_request_time = 0
+        return client
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_retries_on_429(self, mock_sleep, client):
+        """Test that _request retries on HTTP 429"""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", status=429, headers={})
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", json={"ok": True}, status=200)
+
+        result = client._request("GET", "/test", retries=3)
+        assert result == {"ok": True}
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_429_retry_after_valid_int(self, mock_sleep, client):
+        """Test Retry-After header with valid integer on 429"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/test",
+            status=429,
+            headers={"Retry-After": "7"},
+        )
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", json={"data": 1}, status=200)
+
+        result = client._request("GET", "/test", retries=3)
+        assert result == {"data": 1}
+        # Should sleep with min(7, 60) = 7
+        mock_sleep.assert_any_call(7)
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_429_retry_after_invalid_string(self, mock_sleep, client):
+        """Test invalid Retry-After header falls back to exponential backoff"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/test",
+            status=429,
+            headers={"Retry-After": "invalid-value"},
+        )
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", json={"ok": True}, status=200)
+
+        result = client._request("GET", "/test", retries=3)
+        assert result == {"ok": True}
+        # Falls back to min(2^0 * 2, 30) = 2
+        mock_sleep.assert_any_call(2)
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_429_retry_after_capped_at_60(self, mock_sleep, client):
+        """Test Retry-After is capped at 60 seconds"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/test",
+            status=429,
+            headers={"Retry-After": "200"},
+        )
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", json={}, status=200)
+
+        client._request("GET", "/test", retries=3)
+        mock_sleep.assert_any_call(60)
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_retries_on_500(self, mock_sleep, client):
+        """Test that _request retries on HTTP 500 server errors"""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", status=500)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", json={"ok": True}, status=200)
+
+        result = client._request("GET", "/test", retries=3)
+        assert result == {"ok": True}
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_raises_after_exhausting_429_retries(self, mock_sleep, client):
+        """Test that exhausting all retries on 429 raises Exception"""
+        for _ in range(3):
+            responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", status=429)
+
+        with pytest.raises(Exception, match="API request failed after 3 attempts"):
+            client._request("GET", "/test", retries=3)
+
+    @patch("time.sleep", return_value=None)
+    def test_request_retries_on_timeout_then_raises(self, mock_sleep, client):
+        """Test that Timeout is retried and then wrapped in Exception"""
+        with patch.object(
+            client.session, "request", side_effect=requests.exceptions.Timeout("timed out")
+        ):
+            with pytest.raises(Exception, match="API request timed out"):
+                client._request("GET", "/test", retries=3)
+
+    @patch("time.sleep", return_value=None)
+    def test_request_retries_on_connection_error_then_raises(self, mock_sleep, client):
+        """Test that ConnectionError is retried and then wrapped in Exception"""
+        with patch.object(
+            client.session, "request", side_effect=requests.exceptions.ConnectionError("refused")
+        ):
+            with pytest.raises(Exception, match="Connection failed"):
+                client._request("GET", "/test", retries=3)
+
+    @responses.activate
+    def test_request_raises_on_4xx(self, client):
+        """Test that non-429 4xx errors raise immediately (no retry)"""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", status=404, json={"error": "not found"})
+
+        with pytest.raises(Exception, match="API request failed"):
+            client._request("GET", "/test")
+        assert len(responses.calls) == 1
+
+    @responses.activate
+    def test_request_success_returns_json(self, client):
+        """Test that successful response returns parsed JSON"""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", json={"key": "value"}, status=200)
+
+        result = client._request("GET", "/test")
+        assert result == {"key": "value"}
+
+    @responses.activate
+    @patch("time.sleep", return_value=None)
+    def test_request_500_last_attempt_raises(self, mock_sleep, client):
+        """Test that 500 on every attempt results in raise_for_status on last one"""
+        for _ in range(3):
+            responses.add(responses.GET, f"{GAMMA_ENDPOINT}/test", status=500)
+
+        # The last attempt (attempt=2, retries-1=2) doesn't continue, so raise_for_status is called
+        with pytest.raises(Exception):
+            client._request("GET", "/test", retries=3)
+
+
+class TestGammaGetMarkets:
+    """Test get_markets method"""
+
+    @pytest.fixture
+    def client(self):
+        client = GammaClient(base_url=GAMMA_ENDPOINT)
+        client.rate_limiter.last_request_time = 0
+        return client
+
+    @responses.activate
+    def test_get_markets_success(self, client):
+        """Test getting markets returns list"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[
+                {"id": "1", "question": "Market A", "volume": 10000},
+                {"id": "2", "question": "Market B", "volume": 20000},
+            ],
+            status=200,
+        )
+
+        markets = client.get_markets(limit=10)
+        assert len(markets) == 2
+        assert markets[0]["id"] == "1"
+
+    @responses.activate
+    def test_get_markets_params_passed_correctly(self, client):
+        """Test that all parameters are passed correctly"""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets", json=[], status=200)
+
+        client.get_markets(limit=50, offset=10, active=True, closed=False, tag="crypto")
+
+        request_url = responses.calls[0].request.url
+        assert "limit=50" in request_url
+        assert "offset=10" in request_url
+        assert "active=true" in request_url
+        assert "closed=false" in request_url
+        assert "tag=crypto" in request_url
+
+    @responses.activate
+    def test_get_markets_defaults_active_true_closed_false(self, client):
+        """Test that default parameters set active=true and closed=false"""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets", json=[], status=200)
+
+        client.get_markets()
+
+        request_url = responses.calls[0].request.url
+        assert "active=true" in request_url
+        assert "closed=false" in request_url
+
+
+class TestGammaGetMarket:
+    """Test get_market method"""
+
+    @pytest.fixture
+    def client(self):
+        client = GammaClient(base_url=GAMMA_ENDPOINT)
+        client.rate_limiter.last_request_time = 0
+        return client
+
+    @responses.activate
+    def test_get_market_success(self, client):
+        """Test single market lookup"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/abc123",
+            json={"id": "abc123", "question": "Will it rain?", "volume": 5000},
+            status=200,
+        )
+
+        market = client.get_market("abc123")
+        assert market["id"] == "abc123"
+        assert market["question"] == "Will it rain?"
+
+    @responses.activate
+    def test_get_market_not_found(self, client):
+        """Test that 404 raises exception"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/nonexistent",
+            json={"error": "not found"},
+            status=404,
+        )
+
+        with pytest.raises(Exception, match="API request failed"):
+            client.get_market("nonexistent")
+
+
+class TestGammaSearchMarkets:
+    """Test search_markets method"""
+
+    @pytest.fixture
+    def client(self):
+        client = GammaClient(base_url=GAMMA_ENDPOINT)
+        client.rate_limiter.last_request_time = 0
+        return client
+
+    @responses.activate
+    def test_search_markets_search_endpoint_success(self, client):
+        """Test that search_markets uses search endpoint first"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/search",
+            json=[
+                {"id": "1", "question": "Bitcoin price prediction"},
+                {"id": "2", "question": "Ethereum price prediction"},
+            ],
+            status=200,
+        )
+
+        results = client.search_markets("bitcoin", limit=5)
+        assert len(results) == 2
+        assert "Bitcoin" in results[0]["question"]
+        # Verify search params
+        assert "q=bitcoin" in responses.calls[0].request.url
+        assert "limit=5" in responses.calls[0].request.url
+
+    @responses.activate
+    def test_search_markets_fallback_to_local_filter(self, client):
+        """Test that search_markets falls back to local filtering on search endpoint failure"""
+        # Search endpoint fails
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/search",
+            status=500,
+        )
+        # Also add the 500 retry responses (retries=3 means up to 3 attempts)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        # Fallback: get_markets returns list
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[
+                {"id": "1", "question": "Bitcoin price target"},
+                {"id": "2", "question": "Ethereum staking"},
+                {"id": "3", "question": "Will Bitcoin hit 100k?"},
+            ],
+            status=200,
+        )
+
+        with patch("time.sleep", return_value=None):
+            results = client.search_markets("bitcoin", limit=5)
+
+        assert len(results) == 2  # "Bitcoin price target" and "Will Bitcoin hit 100k?"
+        for r in results:
+            assert "bitcoin" in r["question"].lower()
+
+    @responses.activate
+    def test_search_markets_fallback_respects_limit(self, client):
+        """Test that fallback local filter respects limit parameter"""
+        # Search endpoint fails
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        # Fallback returns many bitcoin markets
+        markets = [{"id": str(i), "question": f"Bitcoin market {i}"} for i in range(10)]
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets", json=markets, status=200)
+
+        with patch("time.sleep", return_value=None):
+            results = client.search_markets("bitcoin", limit=3)
+
+        assert len(results) == 3
+
+    @responses.activate
+    def test_search_markets_empty_search_result_triggers_fallback(self, client):
+        """Test that empty search results trigger fallback"""
+        # Search endpoint returns empty list (falsy)
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/search",
+            json=[],
+            status=200,
+        )
+        # Fallback
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[{"id": "1", "question": "Bitcoin futures"}],
+            status=200,
+        )
+
+        results = client.search_markets("bitcoin")
+        assert len(results) == 1
+        assert "Bitcoin" in results[0]["question"]
+
+    @responses.activate
+    def test_search_markets_disables_search_endpoint_after_422(self, client):
+        """Test that search endpoint is disabled after a 422 response."""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/search",
+            status=422,
+            json={"error": "unprocessable"},
+        )
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[{"id": "1", "question": "Bitcoin market alpha"}],
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[{"id": "2", "question": "Bitcoin market beta"}],
+            status=200,
+        )
+
+        first = client.search_markets("bitcoin", limit=5)
+        second = client.search_markets("bitcoin", limit=5)
+
+        assert len(first) == 1
+        assert len(second) == 1
+        assert len(responses.calls) == 3
+        assert "/markets/search" in responses.calls[0].request.url
+        assert "/markets?" in responses.calls[1].request.url
+        assert "/markets?" in responses.calls[2].request.url
+
+    @responses.activate
+    def test_search_markets_keeps_search_endpoint_after_transient_500(self, client):
+        """Transient 5xx errors should not permanently disable search endpoint."""
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        responses.add(responses.GET, f"{GAMMA_ENDPOINT}/markets/search", status=500)
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[{"id": "1", "question": "Bitcoin fallback result"}],
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets/search",
+            json=[{"id": "2", "question": "Bitcoin endpoint recovered"}],
+            status=200,
+        )
+
+        with patch("time.sleep", return_value=None):
+            first = client.search_markets("bitcoin", limit=5)
+            second = client.search_markets("bitcoin", limit=5)
+
+        assert len(first) == 1
+        assert first[0]["id"] == "1"
+        assert len(second) == 1
+        assert second[0]["id"] == "2"
+        assert client._search_endpoint_supported is True
+        assert len(responses.calls) == 5
+        assert "/markets?" in responses.calls[3].request.url
+        assert "/markets/search" in responses.calls[4].request.url
+
+
+class TestGammaGetTrendingMarkets:
+    """Test get_trending_markets method"""
+
+    @pytest.fixture
+    def client(self):
+        client = GammaClient(base_url=GAMMA_ENDPOINT)
+        client.rate_limiter.last_request_time = 0
+        return client
+
+    @responses.activate
+    def test_get_trending_markets_correct_params(self, client):
+        """Test that trending markets uses correct parameters"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[{"id": "1", "volume": 100000}],
+            status=200,
+        )
+
+        client.get_trending_markets(limit=10)
+
+        request_url = responses.calls[0].request.url
+        assert "order=volume24hr" in request_url
+        assert "ascending=false" in request_url
+        assert "active=true" in request_url
+        assert "closed=false" in request_url
+        assert "limit=10" in request_url
+
+    @responses.activate
+    def test_get_trending_markets_returns_list(self, client):
+        """Test that trending markets returns a list"""
+        responses.add(
+            responses.GET,
+            f"{GAMMA_ENDPOINT}/markets",
+            json=[
+                {"id": "1", "volume": 100000},
+                {"id": "2", "volume": 80000},
+            ],
+            status=200,
+        )
+
+        trending = client.get_trending_markets(limit=5)
+        assert len(trending) == 2
+        assert trending[0]["volume"] == 100000
+
+
+class TestGammaIsMarketFresh:
+    """Test is_market_fresh method"""
+
+    @pytest.fixture
+    def client(self):
+        return GammaClient(base_url=GAMMA_ENDPOINT)
+
+    def test_active_not_closed_returns_true(self, client):
+        """Test market with active=True and closed=False is fresh"""
+        market = {"active": True, "closed": False}
+        assert client.is_market_fresh(market) is True
+
+    def test_active_and_closed_returns_false(self, client):
+        """Test market with active=True but closed=True is not fresh"""
+        market = {"active": True, "closed": True}
+        assert client.is_market_fresh(market) is False
+
+    def test_inactive_and_not_closed_returns_false(self, client):
+        """Test market with active=False and closed=False is not fresh"""
+        market = {"active": False, "closed": False}
+        assert client.is_market_fresh(market) is False
+
+    def test_no_flags_with_future_end_date(self, client):
+        """Test market with no active/closed flags but future end date"""
+        market = {"endDate": "2030-12-31T00:00:00Z"}
+        assert client.is_market_fresh(market) is True
+
+    def test_no_flags_with_past_end_date(self, client):
+        """Test market with no active/closed flags and past end date is stale"""
+        market = {"endDate": "2020-01-01T00:00:00Z"}
+        assert client.is_market_fresh(market) is False
+
+    def test_no_flags_no_date_returns_false(self, client):
+        """Test market with no flags and no date is considered stale"""
+        market = {}
+        assert client.is_market_fresh(market) is False
+
+    def test_expired_market_outside_max_age(self, client):
+        """Test market that ended more than max_age_hours ago is stale"""
+        market = {"endDate": "2020-01-01T00:00:00Z"}
+        assert client.is_market_fresh(market, max_age_hours=24) is False
+
+    def test_end_date_iso_key(self, client):
+        """Test that end_date_iso key is also checked"""
+        market = {"end_date_iso": "2030-12-31T00:00:00Z"}
+        assert client.is_market_fresh(market) is True
+
+    def test_invalid_date_returns_false(self, client):
+        """Test that invalid date format returns False"""
+        market = {"endDate": "not-a-date"}
+        assert client.is_market_fresh(market) is False
+
+    def test_only_active_flag_true(self, client):
+        """Test market with only active flag (no closed flag) and no date"""
+        market = {"active": True}
+        # active is not None, closed is None, so the primary check is skipped
+        # Falls to date check, no date, then checks active flag as fallback
+        assert client.is_market_fresh(market) is True
+
+    def test_only_active_flag_false(self, client):
+        """Test market with only active=False (no closed flag) and no date"""
+        market = {"active": False}
+        assert client.is_market_fresh(market) is False
+
+
+class TestGammaFilterFreshMarkets:
+    """Test filter_fresh_markets method"""
+
+    @pytest.fixture
+    def client(self):
+        return GammaClient(base_url=GAMMA_ENDPOINT)
+
+    def test_filters_out_closed_markets(self, client):
+        """Test that closed markets are filtered out"""
+        markets = [
+            {"active": True, "closed": False, "volume": 100},
+            {"active": True, "closed": True, "volume": 200},
+        ]
+
+        result = client.filter_fresh_markets(markets)
+        assert len(result) == 1
+        assert result[0]["volume"] == 100
+
+    def test_filters_out_stale_markets(self, client):
+        """Test that stale/inactive markets are filtered out"""
+        markets = [
+            {"active": True, "closed": False, "volume": 100},
+            {"active": False, "closed": False, "volume": 200},
+        ]
+
+        result = client.filter_fresh_markets(markets)
+        assert len(result) == 1
+        assert result[0]["volume"] == 100
+
+    def test_filters_out_low_volume(self, client):
+        """Test that markets below minimum volume are filtered out"""
+        markets = [
+            {"active": True, "closed": False, "volume": 100, "volume24hr": 0},
+            {"active": True, "closed": False, "volume": 0, "volume24hr": 0},
+        ]
+
+        result = client.filter_fresh_markets(markets, require_volume=True, min_volume=50)
+        assert len(result) == 1
+        assert result[0]["volume"] == 100
+
+    def test_volume24hr_passes_check(self, client):
+        """Test that volume24hr can satisfy the volume requirement"""
+        markets = [
+            {"active": True, "closed": False, "volume": 0, "volume24hr": 100},
+        ]
+
+        result = client.filter_fresh_markets(markets, require_volume=True, min_volume=50)
+        assert len(result) == 1
+
+    def test_require_volume_false_skips_volume_check(self, client):
+        """Test that require_volume=False skips volume filtering"""
+        markets = [
+            {"active": True, "closed": False, "volume": 0},
+        ]
+
+        result = client.filter_fresh_markets(markets, require_volume=False)
+        assert len(result) == 1
+
+    def test_empty_list(self, client):
+        """Test with empty market list"""
+        result = client.filter_fresh_markets([])
+        assert result == []
+
+    def test_all_filtered_out(self, client):
+        """Test when all markets are filtered out"""
+        markets = [
+            {"active": False, "closed": True, "volume": 0},
+        ]
+
+        result = client.filter_fresh_markets(markets)
+        assert result == []
+
+    def test_none_volume_handled(self, client):
+        """Test that None volume values are handled (converted to 0)"""
+        markets = [
+            {"active": True, "closed": False, "volume": None, "volume24hr": None},
+        ]
+
+        result = client.filter_fresh_markets(markets, require_volume=True, min_volume=1)
+        assert len(result) == 0
+
+
+class TestGammaClientInit:
+    """Test GammaClient initialization"""
+
+    def test_default_base_url(self):
+        """Test default base URL"""
+        client = GammaClient()
+        assert client.base_url == GAMMA_ENDPOINT
+
+    def test_custom_base_url(self):
+        """Test custom base URL with trailing slash stripped"""
+        client = GammaClient(base_url="https://custom.example.com/")
+        assert client.base_url == "https://custom.example.com"
+
+    def test_api_key_set_in_headers(self):
+        """Test that API key is set in session headers"""
+        client = GammaClient(api_key="test-key-123")
+        assert client.session.headers.get("Authorization") == "Bearer test-key-123"
+
+    def test_no_api_key_no_auth_header(self):
+        """Test that no API key means no Authorization header"""
+        client = GammaClient()
+        assert "Authorization" not in client.session.headers
+
+    def test_rate_limiter_created(self):
+        """Test that rate limiter is created (shared by default)"""
+        client = GammaClient()
+        assert isinstance(client.rate_limiter, SharedRateLimiter)
+        assert client.rate_limiter.requests_per_minute == 60
+
+    def test_close_session(self):
+        """Test that close() closes the session"""
+        client = GammaClient()
+        with patch.object(client.session, "close") as mock_close:
+            client.close()
+            mock_close.assert_called_once()

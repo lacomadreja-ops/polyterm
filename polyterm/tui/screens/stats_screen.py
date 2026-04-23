@@ -1,0 +1,37 @@
+"""Stats Screen - View detailed market statistics"""
+
+import subprocess
+import sys
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
+from ...utils.errors import handle_api_error
+
+
+def run_stats_screen(console: Console):
+    """Launch stats command"""
+    console.print(Panel(
+        "[bold]Market Statistics[/bold]\n\n"
+        "[dim]View volatility, trends, RSI, and other technical indicators.[/dim]",
+        title="[cyan]Stats[/cyan]",
+        border_style="cyan",
+    ))
+    console.print()
+
+    market = Prompt.ask(
+        "[cyan]Enter market ID or search term[/cyan]",
+        default=""
+    )
+
+    if not market:
+        console.print("[yellow]No market specified.[/yellow]")
+        return
+
+    console.print()
+    console.print("[dim]Analyzing market...[/dim]")
+    console.print()
+
+    try:
+        subprocess.run([sys.executable, "-m", "polyterm.cli.main", "stats", "-m", market])
+    except Exception as e:
+        handle_api_error(console, e, "statistics")

@@ -1,0 +1,28 @@
+"""Size Screen - Position size calculator"""
+
+import subprocess
+import sys
+from rich.console import Console
+from rich.panel import Panel
+from ...utils.errors import handle_api_error
+
+
+def run_size_screen(console: Console):
+    """Launch size calculator in interactive mode"""
+    console.print(Panel(
+        "[bold]Position Size Calculator[/bold]\n\n"
+        "[dim]Calculate optimal bet sizes using Kelly Criterion.[/dim]\n\n"
+        "Enter your bankroll, probability estimate, and market price\n"
+        "to get recommended position sizes.",
+        title="[cyan]Size[/cyan]",
+        border_style="cyan",
+    ))
+    console.print()
+
+    console.print("[dim]Launching position size calculator...[/dim]")
+    console.print()
+
+    try:
+        subprocess.run([sys.executable, "-m", "polyterm.cli.main", "size", "-i"])
+    except Exception as e:
+        handle_api_error(console, e, "position sizing")
